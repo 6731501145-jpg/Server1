@@ -417,6 +417,125 @@ app.get('/api/projects/:id/members', authJWT, requireProjectMember, h(async (req
   );
   res.json(rows);
 }));
+
+/* =====================================================================
+ * Endpoint ที่ Controller เรียกใช้ แต่ยังไม่มีใน app.js
+ * วางต่อจากส่วน Members (ก่อน Error handler) ได้เลย
+ * ===================================================================== */
+ 
+// GET /api/users/:id  -> ข้อมูลสาธารณะ (ไม่ส่ง email) ใช้ค้นหาชื่อก่อนเพิ่มสมาชิก
+// ต้องประกาศหลัง /api/users/me
+app.get('/api/users/:id', authJWT, h(async (req, res) => {
+  const [rows] = await con.query(
+    'SELECT student_id, full_name, avatar_url FROM users WHERE student_id = ?',
+    [req.params.id]
+  );
+  if (!rows.length) return res.status(404).json({ message: 'User not found' });
+  res.json(rows[0]);
+}));
+ 
+// PUT /api/projects/:id  (PC เท่านั้น)
+app.put('/api/projects/:id', authJWT, requirePC, h(async (req, res) => {
+  const fields = ['title', 'course_code', 'description', 'deadline'];
+  const given = fields.filter((k) => k in req.body);
+  if (!given.length) return res.status(400).json({ message: 'Nothing to update' });
+  if ('title' in req.body && !String(req.body.title || '').trim())
+    return res.status(400).json({ message: 'title cannot be empty' });
+  if (req.body.deadline && !validDate(req.body.deadline))
+    return res.status(400).json({ message: 'deadline must be YYYY-MM-DD' });
+ 
+  const vals = given.map((k) => (req.body[k] === '' ? null : req.body[k]));
+  await con.query(
+    `UPDATE projects SET ${given.map((k) => `${k} = ?`).join(', ')} WHERE id = ?`,
+    [...vals, req.params.id]
+  );
+  res.json({ message: 'Project updated' });
+}));
+ 
+// DELETE /api/projects/:id  (PC เท่านั้น) -- tasks / members / notifications ถูกลบตาม FK CASCADE
+app.delete('/api/projects/:id', authJWT, requirePC, h(async (req, res) => {
+  await con.query('DELETE FROM projects WHERE id = ?', [req.params.id]);
+  res.json({ message: 'Project deleted' });
+}));
+ 
+// DELETE /api/projects/:id/members/:studentId  (PC เท่านั้น)
+app.delete('/api/projects/:id/members/:studentId', authJWT, requirePC, h(async (req, res) => {
+  const [m] = await con.query(
+    'SELECT project_role FROM project_members WHERE project_id = ? AND student_id = ?',
+    [req.params.id, req.params.studentId]
+  );
+  if (!m.length) return res.status(404).json({ message: 'Member not found' });
+  if (m[0].project_role === 'PC')
+    return res.status(400).json({ message: 'Cannot remove the PC' });
+ 
+  const conn = await con.getConnection();
+  try {
+    await conn.beginTransaction();
+    // กฎข้อ 2: assigned_to ต้องเป็นสมาชิก -> เคลียร์งานที่เคยมอบหมายให้คนนี้
+    await conn.query(
+      'UPDATE tasks SET assigned_to = NULL WHERE project_id = ? AND assigned_to = ?',
+      [req.params.id, req.params.studentId]
+    );
+    await conn.query(
+      'DELETE FROM project_members WHERE project_id = ? AND student_id = ?',
+      [req.params.id, req.params.studentId]
+    );
+    await conn.commit();
+  } catch (e) {
+    await conn.rollback();
+    throw e;
+  } finally {
+    conn.release();
+  }
+  res.json({ message: 'Member removed' });
+}));
+ 
+// POST /api/projects/:id/announce  (PC เท่านั้น) -> แจ้งสมาชิกทุกคน (กฎข้อ 6)
+app.post('/api/projects/:id/announce', authJWT, requirePC, h(async (req, res) => {
+  const { title, message } = req.body;
+  if (!title || !title.trim() || !message || !message.trim())
+    return res.status(400).json({ message: 'title and message are required' });
+ 
+  const [members] = await con.query(
+    'SELECT student_id FROM project_members WHERE project_id = ? AND student_id <> ?',
+    [req.params.id, req.user.student_id]
+  );
+  for (const m of members) {
+    await notify(con, {
+      recipient_id: m.student_id, sender_id: req.user.student_id,
+      project_id: req.params.id, title: title.trim(), message: message.trim(),
+    });
+  }
+  res.json({ message: 'Announcement sent', sent: members.length });
+}));
+ 
+// GET /api/dashboard  -> สรุปงานของฉันทุกโปรเจค
+app.get('/api/dashboard', authJWT, h(async (req, res) => {
+  const me = req.user.student_id;
+  const [[p]] = await con.query(
+    'SELECT COUNT(*) AS total FROM project_members WHERE student_id = ?', [me]);
+  const [[t]] = await con.query(
+    `SELECT COUNT(*) AS total,
+            COALESCE(SUM(status = 'TODO'), 0)        AS todo,
+            COALESCE(SUM(status = 'IN_PROGRESS'), 0) AS in_progress,
+            COALESCE(SUM(status = 'DONE'), 0)        AS done,
+            COALESCE(SUM(status <> 'DONE' AND due_date < CURDATE()), 0) AS overdue
+     FROM tasks WHERE assigned_to = ?`, [me]);
+  const [deadlines] = await con.query(
+    `SELECT t.id, t.title, t.project_id, p.title AS project_title, t.due_date, t.status
+     FROM tasks t JOIN projects p ON p.id = t.project_id
+     WHERE t.assigned_to = ? AND t.status <> 'DONE' AND t.due_date IS NOT NULL
+     ORDER BY t.due_date LIMIT 20`, [me]);
+ 
+  res.json({
+    total_projects: p.total,
+    total_tasks: t.total,
+    todo: Number(t.todo), in_progress: Number(t.in_progress),
+    done: Number(t.done), overdue: Number(t.overdue),
+    upcoming_deadlines: deadlines,
+  });
+}));
+
 /* =====================================================================
  * poom 4/11/69
  * ===================================================================== */
