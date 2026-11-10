@@ -535,312 +535,284 @@ app.get('/api/dashboard', authJWT, h(async (req, res) => {
     upcoming_deadlines: deadlines,
   });
 }));
-
 /* =====================================================================
- * poom 4/11/69
+ * poom 10/11/69
  * ===================================================================== */
 
-const TASK_STATUS = ['TODO', 'IN_PROGRESS', 'DONE'];
-
-/* ============================ Helpers ============================ */
-
-// สร้างแจ้งเตือน (ไม่แจ้งตัวเอง) รับ db ได้ทั้ง con และ connection ใน transaction
-const notify = async (db, { recipient_id, sender_id, project_id, title, message }) => {
-  if (!recipient_id || recipient_id === sender_id) return;
-  await db.query(
-    `INSERT INTO notifications (id, recipient_id, sender_id, project_id, title, message)
-     VALUES (?,?,?,?,?,?)`,
-    [crypto.randomUUID(), recipient_id, sender_id || null, project_id || null, title, message]
-  );
-};
-
-// โหลด task จาก :taskId แล้วเช็กว่าเป็นสมาชิกโปรเจคของ task นั้น
-// -> req.task, req.projectRole
-const loadTask = h(async (req, res, next) => {
-  const [tasks] = await con.query('SELECT * FROM tasks WHERE id = ?', [req.params.taskId]);
-  if (!tasks.length) return res.status(404).json({ message: 'Task not found' });
-
-  const [m] = await con.query(
-    'SELECT project_role FROM project_members WHERE project_id = ? AND student_id = ?',
-    [tasks[0].project_id, req.user.student_id]
-  );
-  if (!m.length) return res.status(403).json({ message: 'Not a member of this project' });
-
-  req.task = tasks[0];
-  req.projectRole = m[0].project_role;
-  next();
-});
-
-const isMember = async (project_id, student_id) => {
-  const [rows] = await con.query(
-    'SELECT 1 FROM project_members WHERE project_id = ? AND student_id = ?',
-    [project_id, student_id]
-  );
-  return rows.length > 0;
-};
-
-const validDate = (v) => v === null || /^\d{4}-\d{2}-\d{2}$/.test(v);
 
 /* ============================== Tasks ============================== */
-
-// POST /api/projects/:id/tasks  (PC เท่านั้น)
-app.post('/api/projects/:id/tasks', authJWT, requirePC, h(async (req, res) => {
+ 
+// GET /api/projects/:projectId/tasks
+app.get('/api/projects/:projectId/tasks', authJWT, requireMemberByProjectId, h(async (req, res) => {
+  const [rows] = await con.query(
+    `${TASK_SELECT} WHERE t.project_id = ? ORDER BY t.due_date IS NULL, t.due_date, t.created_at DESC`,
+    [req.params.projectId]
+  );
+  res.json(rows);
+}));
+ 
+// POST /api/projects/:projectId/tasks  (PC เท่านั้น)
+app.post('/api/projects/:projectId/tasks', authJWT, ...requirePCByProjectId, h(async (req, res) => {
   const { title, description, assigned_to, due_date } = req.body;
-  if (!title || !title.trim()) return res.status(400).json({ message: 'title is required' });
-  if (due_date && !validDate(due_date))
+ 
+  if (!isStr(title) || !title.trim()) return res.status(400).json({ message: 'title is required' });
+  if (title.trim().length > 200) return res.status(400).json({ message: 'title must be at most 200 characters' });
+  if (description != null && !isStr(description))
+    return res.status(400).json({ message: 'description must be a string' });
+  if (due_date != null && due_date !== '' && !isValidDateStr(due_date))
     return res.status(400).json({ message: 'due_date must be YYYY-MM-DD' });
-  if (assigned_to && !(await isMember(req.params.id, assigned_to)))
-    return res.status(400).json({ message: 'assigned_to must be a member of this project' });
-
+ 
+  let assignee = null;
+  if (assigned_to != null && assigned_to !== '') {
+    if (!isStr(assigned_to)) return res.status(400).json({ message: 'assigned_to must be a student_id' });
+    assignee = assigned_to.trim();
+    if (!(await isProjectMember(req.params.projectId, assignee)))
+      return res.status(400).json({ message: 'assigned_to must be a member of this project' });
+  }
+ 
   const id = crypto.randomUUID();
   await con.query(
-    `INSERT INTO tasks (id, project_id, title, description, assigned_to, due_date)
-     VALUES (?,?,?,?,?,?)`,
-    [id, req.params.id, title.trim(), description || null, assigned_to || null, due_date || null]
+    'INSERT INTO tasks (id, project_id, title, description, assigned_to, due_date) VALUES (?,?,?,?,?,?)',
+    [id, req.params.projectId, title.trim(), description || null, assignee, due_date || null]
   );
-
-  await notify(con, {
-    recipient_id: assigned_to,
-    sender_id: req.user.student_id,
-    project_id: req.params.id,
-    title: 'New task assigned',
-    message: `You have been assigned a task: "${title.trim()}"`,
-  });
-
+ 
+  if (assignee && assignee !== req.user.student_id)
+    await notify(con, {
+      recipient_id: assignee, sender_id: req.user.student_id,
+      project_id: req.params.projectId, task_id: id,
+      title: 'New task assigned', message: `You have been assigned the task "${title.trim()}"`,
+    });
+ 
   res.status(201).json({ id, message: 'Task created' });
 }));
-
-// GET /api/projects/:id/tasks?status=TODO&assigned_to=6531501001
-app.get('/api/projects/:id/tasks', authJWT, requireProjectMember, h(async (req, res) => {
-  const where = ['t.project_id = ?'];
-  const vals = [req.params.id];
-
-  if (req.query.status) {
-    if (!TASK_STATUS.includes(req.query.status))
-      return res.status(400).json({ message: `status must be one of ${TASK_STATUS.join(', ')}` });
-    where.push('t.status = ?'); vals.push(req.query.status);
-  }
-  if (req.query.assigned_to) {
-    where.push('t.assigned_to = ?'); vals.push(req.query.assigned_to);
-  }
-
-  const [rows] = await con.query(
-    `SELECT t.id, t.title, t.description, t.assigned_to, u.full_name AS assignee_name,
-            t.due_date, t.status, t.submission_url, t.created_at, t.updated_at
-     FROM tasks t
-     LEFT JOIN users u ON u.student_id = t.assigned_to
-     WHERE ${where.join(' AND ')}
-     ORDER BY t.due_date IS NULL, t.due_date, t.created_at DESC`,
-    vals
-  );
-  res.json(rows);
-}));
-
-// GET /api/tasks/mine  -> งานที่มอบหมายให้ฉัน (ทุกโปรเจค)
-app.get('/api/tasks/mine', authJWT, h(async (req, res) => {
-  const [rows] = await con.query(
-    `SELECT t.id, t.project_id, p.title AS project_title, t.title, t.due_date,
-            t.status, t.submission_url
-     FROM tasks t
-     JOIN projects p ON p.id = t.project_id
-     WHERE t.assigned_to = ?
-     ORDER BY t.status = 'DONE', t.due_date IS NULL, t.due_date`,
-    [req.user.student_id]
-  );
-  res.json(rows);
-}));
-
-// GET /api/tasks/:taskId
-app.get('/api/tasks/:taskId', authJWT, loadTask, h(async (req, res) => {
-  const [rows] = await con.query(
-    `SELECT t.*, u.full_name AS assignee_name
-     FROM tasks t
-     LEFT JOIN users u ON u.student_id = t.assigned_to
-     WHERE t.id = ?`,
-    [req.params.taskId]
-  );
+ 
+// GET /api/tasks/:id
+app.get('/api/tasks/:id', authJWT, taskAccess('id'), h(async (req, res) => {
+  const [rows] = await con.query(`${TASK_SELECT} WHERE t.id = ?`, [req.params.id]);
   res.json({ ...rows[0], my_role: req.projectRole });
 }));
-
-// PUT /api/tasks/:taskId
-//  - PC: แก้ได้ทุกช่อง (title, description, assigned_to, due_date, status, submission_url)
-//  - ผู้ที่ได้รับมอบหมาย: แก้ได้เฉพาะ status กับ submission_url
-app.put('/api/tasks/:taskId', authJWT, loadTask, h(async (req, res) => {
-  const task = req.task;
-  const me = req.user.student_id;
-  const isPC = req.projectRole === 'PC';
-  const isAssignee = task.assigned_to === me;
-  if (!isPC && !isAssignee)
-    return res.status(403).json({ message: 'Only PC or the assignee can update this task' });
-
-  const memberFields = ['status', 'submission_url'];
-  const pcFields = ['title', 'description', 'assigned_to', 'due_date'];
-  const allowed = isPC ? [...pcFields, ...memberFields] : memberFields;
-
-  const given = Object.keys(req.body).filter((k) => [...pcFields, ...memberFields].includes(k));
-  if (!given.length) return res.status(400).json({ message: 'Nothing to update' });
-  if (given.some((k) => !allowed.includes(k)))
-    return res.status(403).json({ message: 'Assignee can only update status and submission_url' });
-
-  const b = req.body;
-  if ('title' in b && (!b.title || !b.title.trim()))
-    return res.status(400).json({ message: 'title cannot be empty' });
-  if ('status' in b && !TASK_STATUS.includes(b.status))
-    return res.status(400).json({ message: `status must be one of ${TASK_STATUS.join(', ')}` });
-  if ('due_date' in b && b.due_date !== null && !validDate(b.due_date))
-    return res.status(400).json({ message: 'due_date must be YYYY-MM-DD or null' });
-  if ('assigned_to' in b && b.assigned_to && !(await isMember(task.project_id, b.assigned_to)))
-    return res.status(400).json({ message: 'assigned_to must be a member of this project' });
-
-  const sets = given.map((k) => `${k} = ?`);
-  const vals = given.map((k) => (k === 'title' ? b[k].trim() : b[k] === '' ? null : b[k]));
-  await con.query(`UPDATE tasks SET ${sets.join(', ')} WHERE id = ?`, [...vals, task.id]);
-
-  // --- แจ้งเตือน ---
-  if ('assigned_to' in b && b.assigned_to !== task.assigned_to) {
+ 
+// PUT /api/tasks/:id  (PC เท่านั้น) แก้ได้: title, description, due_date
+app.put('/api/tasks/:id', authJWT, ...requireTaskPC, h(async (req, res) => {
+  const b = req.body || {};
+  const sets = [];
+  const vals = [];
+ 
+  if ('title' in b) {
+    if (!isStr(b.title) || !b.title.trim() || b.title.trim().length > 200)
+      return res.status(400).json({ message: 'title must be 1-200 characters' });
+    sets.push('title = ?'); vals.push(b.title.trim());
+  }
+  if ('description' in b) {
+    if (b.description != null && !isStr(b.description))
+      return res.status(400).json({ message: 'description must be a string' });
+    sets.push('description = ?'); vals.push(b.description || null);
+  }
+  if ('due_date' in b) {
+    if (b.due_date != null && b.due_date !== '' && !isValidDateStr(b.due_date))
+      return res.status(400).json({ message: 'due_date must be YYYY-MM-DD' });
+    sets.push('due_date = ?'); vals.push(b.due_date || null);
+  }
+  if (!sets.length) return res.status(400).json({ message: 'Nothing to update' });
+ 
+  // [แก้ #5] อ่านวันส่งเดิมก่อน UPDATE เพื่อเทียบว่าเปลี่ยนจริงไหม
+  const [[old]] = await con.query(
+    "SELECT DATE_FORMAT(due_date, '%Y-%m-%d') AS d FROM tasks WHERE id = ?", [req.params.id]);
+ 
+  await con.query(`UPDATE tasks SET ${sets.join(', ')} WHERE id = ?`, [...vals, req.params.id]);
+ 
+  // [แก้ #5] วันส่งเปลี่ยน -> แจ้งผู้ถูกมอบหมาย (UI: Extend Deadline)
+  if ('due_date' in b && (b.due_date || null) !== (old.d || null)
+      && req.task.assigned_to && req.task.assigned_to !== req.user.student_id)
     await notify(con, {
-      recipient_id: b.assigned_to, sender_id: me, project_id: task.project_id,
-      title: 'New task assigned', message: `You have been assigned a task: "${task.title}"`,
+      recipient_id: req.task.assigned_to, sender_id: req.user.student_id,
+      project_id: req.task.project_id, task_id: req.task.id,
+      title: 'Deadline changed', message: `New due date for "${req.task.title}": ${b.due_date}`,
     });
-  }
-  if ('status' in b && b.status !== task.status) {
-    // แจ้ง PC ของโปรเจค (กรณีผู้รับงานเปลี่ยนสถานะ) และแจ้งผู้รับงาน (กรณี PC เปลี่ยน)
-    const [[pc]] = await con.query(
-      "SELECT student_id FROM project_members WHERE project_id = ? AND project_role = 'PC'",
-      [task.project_id]
-    );
-    const msg = `Task "${task.title}" status changed: ${task.status} -> ${b.status}`;
-    await notify(con, { recipient_id: pc?.student_id, sender_id: me, project_id: task.project_id, title: 'Task status updated', message: msg });
-    await notify(con, { recipient_id: task.assigned_to, sender_id: me, project_id: task.project_id, title: 'Task status updated', message: msg });
-  }
-
+ 
   res.json({ message: 'Task updated' });
 }));
-
-// DELETE /api/tasks/:taskId  (PC เท่านั้น)
-app.delete('/api/tasks/:taskId', authJWT, loadTask, h(async (req, res) => {
-  if (req.projectRole !== 'PC') return res.status(403).json({ message: 'PC only' });
-
-  const conn = await con.getConnection();
-  try {
-    await conn.beginTransaction();
-    await conn.query('DELETE FROM task_comments WHERE task_id = ?', [req.task.id]);
-    await conn.query('DELETE FROM tasks WHERE id = ?', [req.task.id]);
-    await conn.commit();
-  } catch (e) {
-    await conn.rollback();
-    throw e;
-  } finally {
-    conn.release();
+ 
+// PATCH /api/tasks/:id/status  (PC หรือผู้ถูกมอบหมาย)
+app.patch('/api/tasks/:id/status', authJWT, taskAccess('id'), h(async (req, res) => {
+  const { status } = req.body;
+  if (!TASK_STATUSES.includes(status))
+    return res.status(400).json({ message: `status must be one of ${TASK_STATUSES.join(', ')}` });
+ 
+  const t = req.task;
+  const me = req.user.student_id;
+  const isPC = req.projectRole === 'PC';
+  if (!isPC && t.assigned_to !== me)
+    return res.status(403).json({ message: 'Only the assignee or the PC can change the status' });
+ 
+  await con.query(
+    status === 'DONE'
+      ? 'UPDATE tasks SET status = ?, completed_at = COALESCE(completed_at, NOW()) WHERE id = ?'
+      : 'UPDATE tasks SET status = ?, completed_at = NULL WHERE id = ?',
+    [status, t.id]
+  );
+ 
+  if (status === 'DONE' && t.status !== 'DONE' && !isPC) {
+    const pc = await getPcId(t.project_id);
+    if (pc)
+      await notify(con, {
+        recipient_id: pc, sender_id: me, project_id: t.project_id, task_id: t.id,
+        title: 'Task completed', message: `The task "${t.title}" is now DONE`,
+      });
   }
+ 
+  res.json({ message: 'Status updated', status });
+}));
+ 
+// PATCH /api/tasks/:id/assign  (PC เท่านั้น)
+app.patch('/api/tasks/:id/assign', authJWT, ...requireTaskPC, h(async (req, res) => {
+  if (!('assigned_to' in req.body))
+    return res.status(400).json({ message: 'assigned_to is required (student_id or null)' });
+ 
+  const t = req.task;
+  let assignee = null;
+  const raw = req.body.assigned_to;
+  if (raw != null && raw !== '') {
+    if (!isStr(raw)) return res.status(400).json({ message: 'assigned_to must be a student_id' });
+    assignee = raw.trim();
+    if (!(await isProjectMember(t.project_id, assignee)))
+      return res.status(400).json({ message: 'assigned_to must be a member of this project' });
+  }
+ 
+  await con.query('UPDATE tasks SET assigned_to = ? WHERE id = ?', [assignee, t.id]);
+ 
+  if (assignee && assignee !== t.assigned_to && assignee !== req.user.student_id)
+    await notify(con, {
+      recipient_id: assignee, sender_id: req.user.student_id,
+      project_id: t.project_id, task_id: t.id,
+      title: 'New task assigned', message: `You have been assigned the task "${t.title}"`,
+    });
+ 
+  res.json({ message: 'Task assigned', assigned_to: assignee });
+}));
+ 
+// POST /api/tasks/:id/submission  (ผู้ถูกมอบหมายหรือ PC)  body: { submission_url }
+app.post('/api/tasks/:id/submission', authJWT, taskAccess('id'), h(async (req, res) => {
+  const { submission_url } = req.body;
+  if (!isStr(submission_url) || !submission_url.trim() || submission_url.trim().length > 500)
+    return res.status(400).json({ message: 'submission_url must be 1-500 characters' });
+ 
+  const t = req.task;
+  const me = req.user.student_id;
+  if (req.projectRole !== 'PC' && t.assigned_to !== me)
+    return res.status(403).json({ message: 'Only the assignee can submit work for this task' });
+ 
+  await con.query(
+    'UPDATE tasks SET submission_url = ?, submitted_at = NOW() WHERE id = ?',
+    [submission_url.trim(), t.id]
+  );
+ 
+  const pc = await getPcId(t.project_id);
+  if (pc && pc !== me)
+    await notify(con, {
+      recipient_id: pc, sender_id: me, project_id: t.project_id, task_id: t.id,
+      title: 'Work submitted', message: `New submission for the task "${t.title}"`,
+    });
+ 
+  res.json({ message: 'Submission saved' });
+}));
+ 
+// DELETE /api/tasks/:id  (PC เท่านั้น)
+app.delete('/api/tasks/:id', authJWT, ...requireTaskPC, h(async (req, res) => {
+  await con.query('DELETE FROM tasks WHERE id = ?', [req.params.id]);
   res.json({ message: 'Task deleted' });
 }));
-
+ 
 /* =========================== Task comments =========================== */
-
-// POST /api/tasks/:taskId/comments  (สมาชิกโปรเจคทุกคน)
-app.post('/api/tasks/:taskId/comments', authJWT, loadTask, h(async (req, res) => {
-  const { comment_text } = req.body;
-  if (!comment_text || !comment_text.trim())
-    return res.status(400).json({ message: 'comment_text is required' });
-
-  const [result] = await con.query(
-    'INSERT INTO task_comments (task_id, author_id, comment_text) VALUES (?,?,?)',
-    [req.task.id, req.user.student_id, comment_text.trim()]
-  );
-
-  await notify(con, {
-    recipient_id: req.task.assigned_to,
-    sender_id: req.user.student_id,
-    project_id: req.task.project_id,
-    title: 'New comment',
-    message: `New comment on task "${req.task.title}"`,
-  });
-
-  res.status(201).json({ id: result.insertId, message: 'Comment added' });
-}));
-
+ 
 // GET /api/tasks/:taskId/comments
-app.get('/api/tasks/:taskId/comments', authJWT, loadTask, h(async (req, res) => {
+app.get('/api/tasks/:taskId/comments', authJWT, taskAccess('taskId'), h(async (req, res) => {
+  // [แก้ #6] JOIN project_members เพื่อส่ง author_role (PC / MEMBER)
   const [rows] = await con.query(
-    `SELECT c.id, c.author_id, u.full_name AS author_name, u.avatar_url,
-            c.comment_text, c.created_at
+    `SELECT c.id, c.task_id, c.author_id, u.full_name AS author_name, u.avatar_url AS author_avatar,
+            pm.project_role AS author_role, c.comment_text, c.created_at
      FROM task_comments c
      JOIN users u ON u.student_id = c.author_id
+     LEFT JOIN project_members pm ON pm.project_id = ? AND pm.student_id = c.author_id
      WHERE c.task_id = ?
-     ORDER BY c.created_at`,
-    [req.params.taskId]
+     ORDER BY c.created_at, c.id`,
+    [req.task.project_id, req.params.taskId]
   );
   res.json(rows);
 }));
-
-// DELETE /api/comments/:commentId  (เจ้าของคอมเมนต์ หรือ PC)
-app.delete('/api/comments/:commentId', authJWT, h(async (req, res) => {
-  const [rows] = await con.query(
-    `SELECT c.id, c.author_id, t.project_id
-     FROM task_comments c JOIN tasks t ON t.id = c.task_id
+ 
+// POST /api/tasks/:taskId/comments  body: { comment_text }
+app.post('/api/tasks/:taskId/comments', authJWT, taskAccess('taskId'), h(async (req, res) => {
+  const { comment_text } = req.body;
+  if (!isStr(comment_text) || !comment_text.trim())
+    return res.status(400).json({ message: 'comment_text is required' });
+ 
+  const t = req.task;
+  const me = req.user.student_id;
+ 
+  const [r] = await con.query(
+    'INSERT INTO task_comments (task_id, author_id, comment_text) VALUES (?,?,?)',
+    [t.id, me, comment_text.trim()]
+  );
+  const [[comment]] = await con.query(
+    `SELECT c.id, c.task_id, c.author_id, u.full_name AS author_name, u.avatar_url AS author_avatar,
+            c.comment_text, c.created_at
+     FROM task_comments c JOIN users u ON u.student_id = c.author_id
      WHERE c.id = ?`,
-    [req.params.commentId]
+    [r.insertId]
   );
-  if (!rows.length) return res.status(404).json({ message: 'Comment not found' });
-  const c = rows[0];
-
-  const [m] = await con.query(
-    'SELECT project_role FROM project_members WHERE project_id = ? AND student_id = ?',
-    [c.project_id, req.user.student_id]
+ 
+  const recipients = new Set([t.assigned_to, await getPcId(t.project_id)]);
+  recipients.delete(null);
+  recipients.delete(me);
+  for (const rid of recipients)
+    await notify(con, {
+      recipient_id: rid, sender_id: me, project_id: t.project_id, task_id: t.id,
+      title: 'New comment', message: `${comment.author_name} commented on "${t.title}"`,
+    });
+ 
+  // [แก้ #6] ส่ง author_role กลับไปด้วย
+  res.status(201).json({ ...comment, author_role: req.projectRole });
+}));
+ 
+// DELETE /api/comments/:id  (เจ้าของเท่านั้น)
+app.delete('/api/comments/:id', authJWT, h(async (req, res) => {
+  const [r] = await con.query(
+    'DELETE FROM task_comments WHERE id = ? AND author_id = ?',
+    [req.params.id, req.user.student_id]
   );
-  if (!m.length) return res.status(403).json({ message: 'Not a member of this project' });
-  if (c.author_id !== req.user.student_id && m[0].project_role !== 'PC')
-    return res.status(403).json({ message: 'Only the author or PC can delete this comment' });
-
-  await con.query('DELETE FROM task_comments WHERE id = ?', [c.id]);
+  if (!r.affectedRows) return res.status(404).json({ message: 'Comment not found' });
   res.json({ message: 'Comment deleted' });
 }));
-
+ 
 /* =========================== Notifications =========================== */
-// หมายเหตุ: ต้องประกาศ /unread-count และ /read-all ก่อน /:id
-
-// GET /api/notifications?unread=true&limit=50&offset=0
+ 
+// GET /api/notifications
 app.get('/api/notifications', authJWT, h(async (req, res) => {
-  const limit = Math.min(parseInt(req.query.limit, 10) || 50, 100);
-  const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
-  const where = ['n.recipient_id = ?'];
-  const vals = [req.user.student_id];
-  if (req.query.unread === 'true') where.push('n.is_read = 0');
-
   const [rows] = await con.query(
-    `SELECT n.id, n.sender_id, s.full_name AS sender_name, n.project_id,
-            n.title, n.message, n.is_read, n.created_at
+    `SELECT n.id, n.sender_id, s.full_name AS sender_name,
+            n.project_id, n.task_id, n.title, n.message, n.is_read, n.created_at
      FROM notifications n
      LEFT JOIN users s ON s.student_id = n.sender_id
-     WHERE ${where.join(' AND ')}
-     ORDER BY n.created_at DESC
-     LIMIT ? OFFSET ?`,
-    [...vals, limit, offset]
-  );
-  res.json(rows);
-}));
-
-// GET /api/notifications/unread-count
-app.get('/api/notifications/unread-count', authJWT, h(async (req, res) => {
-  const [[row]] = await con.query(
-    'SELECT COUNT(*) AS unread FROM notifications WHERE recipient_id = ? AND is_read = 0',
+     WHERE n.recipient_id = ?
+     ORDER BY n.created_at DESC, n.id`,
     [req.user.student_id]
   );
-  res.json({ unread: row.unread });
+  // [แก้ #3] เติม type ที่คำนวณจาก title
+  res.json(rows.map((n) => ({ ...n, type: notifType(n), is_read: !!n.is_read })));
 }));
-
-// PUT /api/notifications/read-all
-app.put('/api/notifications/read-all', authJWT, h(async (req, res) => {
-  const [r] = await con.query(
+ 
+// PATCH /api/notifications/read-all  (ปุ่ม "Mark all as read")
+app.patch('/api/notifications/read-all', authJWT, h(async (req, res) => {
+  await con.query(
     'UPDATE notifications SET is_read = 1 WHERE recipient_id = ? AND is_read = 0',
     [req.user.student_id]
   );
-  res.json({ message: 'All notifications marked as read', updated: r.affectedRows });
+  res.json({ message: 'All marked as read' });
 }));
-
-// PUT /api/notifications/:id/read
-app.put('/api/notifications/:id/read', authJWT, h(async (req, res) => {
+ 
+// PATCH /api/notifications/:id/read  (เจ้าของเท่านั้น)
+app.patch('/api/notifications/:id/read', authJWT, h(async (req, res) => {
   const [r] = await con.query(
     'UPDATE notifications SET is_read = 1 WHERE id = ? AND recipient_id = ?',
     [req.params.id, req.user.student_id]
@@ -848,8 +820,8 @@ app.put('/api/notifications/:id/read', authJWT, h(async (req, res) => {
   if (!r.affectedRows) return res.status(404).json({ message: 'Notification not found' });
   res.json({ message: 'Marked as read' });
 }));
-
-// DELETE /api/notifications/:id
+ 
+// DELETE /api/notifications/:id  (เจ้าของเท่านั้น)
 app.delete('/api/notifications/:id', authJWT, h(async (req, res) => {
   const [r] = await con.query(
     'DELETE FROM notifications WHERE id = ? AND recipient_id = ?',
