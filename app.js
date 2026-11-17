@@ -540,6 +540,96 @@ app.get('/api/dashboard', authJWT, h(async (req, res) => {
  * ===================================================================== */
 
 
+/* ============ Helpers & middleware ของ Tasks / Notifications ============ */
+/* (ส่วนนี้เพิ่มเข้ามา เพราะไฟล์เดิมเรียกใช้แต่ไม่ได้ประกาศไว้)            */
+
+const TASK_STATUSES = ['TODO', 'IN_PROGRESS', 'DONE'];
+
+// ใช้ต่อด้วย WHERE ... (alias ของ tasks คือ t)
+const TASK_SELECT = `
+  SELECT t.*, u.full_name AS assignee_name, u.avatar_url AS assignee_avatar
+  FROM tasks t
+  LEFT JOIN users u ON u.student_id = t.assigned_to`;
+
+const isProjectMember = async (projectId, studentId) => {
+  const [rows] = await con.query(
+    'SELECT 1 FROM project_members WHERE project_id = ? AND student_id = ?',
+    [projectId, studentId]
+  );
+  return rows.length > 0;
+};
+
+const getPcId = async (projectId) => {
+  const [rows] = await con.query(
+    "SELECT student_id FROM project_members WHERE project_id = ? AND project_role = 'PC' LIMIT 1",
+    [projectId]
+  );
+  return rows.length ? rows[0].student_id : null;
+};
+
+const notify = (db, { recipient_id, sender_id = null, project_id = null, task_id = null, title, message }) =>
+  db.query(
+    `INSERT INTO notifications (id, recipient_id, sender_id, project_id, task_id, title, message)
+     VALUES (?,?,?,?,?,?,?)`,
+    [crypto.randomUUID(), recipient_id, sender_id, project_id, task_id, title, message]
+  );
+
+// คำนวณ type จาก title (ปรับให้ตรงกับที่ฝั่ง Flutter ใช้ได้)
+const notifType = (n) => {
+  const t = (n.title || '').toLowerCase();
+  if (t.includes('assigned')) return 'task_assigned';
+  if (t.includes('deadline')) return 'deadline';
+  if (t.includes('comment')) return 'comment';
+  if (t.includes('submitted')) return 'submission';
+  if (t.includes('completed')) return 'task_completed';
+  if (t.includes('added') || t.includes('removed')) return 'project';
+  return 'announcement';
+};
+
+// สมาชิกโปรเจค โดยอ่าน projectId จาก :projectId
+const requireMemberByProjectId = h(async (req, res, next) => {
+  const [rows] = await con.query(
+    'SELECT project_role FROM project_members WHERE project_id = ? AND student_id = ?',
+    [req.params.projectId, req.user.student_id]
+  );
+  if (!rows.length) return res.status(403).json({ message: 'Not a member of this project' });
+  req.projectRole = rows[0].project_role;
+  next();
+});
+
+// PC ของโปรเจค โดยอ่านจาก :projectId (ใช้แบบ ...requirePCByProjectId)
+const requirePCByProjectId = [
+  requireMemberByProjectId,
+  (req, res, next) => {
+    if (req.projectRole !== 'PC') return res.status(403).json({ message: 'PC only' });
+    next();
+  },
+];
+
+// โหลด task จาก :<param> แล้วเช็กว่าเป็นสมาชิกโปรเจคของ task นั้น
+// ตั้งค่า req.task และ req.projectRole
+const taskAccess = (param = 'id') => h(async (req, res, next) => {
+  const [tasks] = await con.query('SELECT * FROM tasks WHERE id = ?', [req.params[param]]);
+  if (!tasks.length) return res.status(404).json({ message: 'Task not found' });
+  const [rows] = await con.query(
+    'SELECT project_role FROM project_members WHERE project_id = ? AND student_id = ?',
+    [tasks[0].project_id, req.user.student_id]
+  );
+  if (!rows.length) return res.status(403).json({ message: 'Not a member of this project' });
+  req.task = tasks[0];
+  req.projectRole = rows[0].project_role;
+  next();
+});
+
+// PC ของโปรเจคที่ task นี้อยู่ (ใช้แบบ ...requireTaskPC)
+const requireTaskPC = [
+  taskAccess('id'),
+  (req, res, next) => {
+    if (req.projectRole !== 'PC') return res.status(403).json({ message: 'PC only' });
+    next();
+  },
+];
+
 /* ============================== Tasks ============================== */
  
 // GET /api/projects/:projectId/tasks
